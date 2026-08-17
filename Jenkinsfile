@@ -1,103 +1,73 @@
 pipeline {
     agent any
+
     options {
+        skipDefaultCheckout()
         disableConcurrentBuilds()
         timestamps()
         timeout(time: 60, unit: 'MINUTES')
     }
+
     environment {
-        GIT_REPO              = "https://github.com/AnandR1225/hello-world.git"
-        GIT_CREDENTIALS_ID    = "github1"
+        DOCKER_REPO           = "anand/hello-world"
+        DOCKER_CREDENTIALS_ID = "docker-creds"
+        KUBE_CRED             = "kube-cred"
+    }
 
-    }
-    triggers {
-        githubPush()
-    }
+    // No SCM-level `triggers { githubPush() }` needed when using a
+    // Multibranch Pipeline with GitHub Branch Source + "Discover tags" —
+    // the branch/tag indexing itself acts as the trigger. Adding
+    // githubPush() here is harmless (it just re-registers the hook) but
+    // is not what causes tag runs to fire; the branch source behavior is.
+
     stages {
-        stage('Clean Workspace') {
-            steps { cleanWs() }
-        }
 
-        stage('Checkout Code') {
+        stage('Checkout') {
             steps {
-                script {
-                    // TAG_NAME is set automatically when the Multibranch job is
-                    // triggered by a discovered tag. BRANCH_NAME covers branch builds.
-                    def refName = env.TAG_NAME ?: env.BRANCH_NAME ?: 'build/jenkins-testing'
-                    def refPath = env.TAG_NAME ? "refs/tags/${refName}" : "*/${refName}"
-
-                    echo "Checking out: ${refName} (${env.TAG_NAME ? 'tag' : 'branch'})"
-
-                    checkout([$class: 'GitSCM',
-                        branches: [[name: refPath]],
-                        userRemoteConfigs: [[
-                            url: env.GIT_REPO,
-                            credentialsId: env.GIT_CREDENTIALS_ID
-                        ]]
-                    ])
-
-                    env.ACTUAL_BRANCH = refName
-                }
+                checkout scm
             }
         }
 
-        stage('Determine Environment') {
+        stage('Gate: Tag builds only') {
             steps {
                 script {
-                    if (env.TAG_NAME) {
-                        env.DEPLOY_ENV = "production"
-                        env.TAG_TYPE   = "release"
+                    if (!env.TAG_NAME?.trim()) {
+                        currentBuild.result = 'NOT_BUILT'
+                        error("Not a tag build (BRANCH_NAME=${env.BRANCH_NAME}) — aborting before any build/push/deploy stage.")
+                    }
+
+                    if (env.TAG_NAME ==~ /^v?\d+\.\d+\.\d+-rc\d+$/) {
+                        env.DEPLOY_ENV = "staging"
+                        env.NAMESPACE  = "app-staging"
+                    } else if (env.TAG_NAME ==~ /^v?\d+\.\d+\.\d+$/) {
+                        env.DEPLOY_ENV = "prod"
+                        env.NAMESPACE  = "app-prod"
                     } else {
-                        error("Unsupported trigger: no TAG_NAME present. This pipeline only builds on tag pushes (ref: ${env.ACTUAL_BRANCH}).")
+                        error("Tag '${env.TAG_NAME}' doesn't match vX.Y.Z or vX.Y.Z-rcN — aborting.")
                     }
 
-                    echo """
-                    Environment Info
-                    ----------------------
-                    Ref:    ${env.ACTUAL_BRANCH}
-                    Deploy: ${env.DEPLOY_ENV}
-                    Repo:   ${env.IMAGE_NAME}
-                    Mode:   ${env.TAG_TYPE}
-                    """
-                }
-            }
-        }
-
-        stage('Generate Docker Tag') {
-            steps {
-                script {
-                    if (!env.TAG_NAME) {
-                        error("No TAG_NAME present — this job wasn't triggered by a tag push. Stopping build.")
-                    }
                     env.IMAGE_TAG = env.TAG_NAME
-                    echo "FINAL Docker Tag: ${env.IMAGE_TAG}"
+                    echo "Tag=${env.TAG_NAME} -> env=${env.DEPLOY_ENV} ns=${env.NAMESPACE} image_tag=${env.IMAGE_TAG}"
                 }
             }
         }
 
-        stage('Docker Login') {
+        stage('Build Image') {
             steps {
-                script {
-                    withCredentials([usernamePassword(credentialsId: env.DOCKER_CREDENTIALS_ID,
-                        usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASSWORD')]) {
-                        sh 'echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USER" --password-stdin'
-                    }
-                }
+                sh "docker build -t ${DOCKER_REPO}:${IMAGE_TAG} ."
             }
         }
+    }
 
-        stage('Docker Build & Push') {
-            steps {
-                script {
-                    def imageFull = "${env.IMAGE_NAME}:${env.IMAGE_TAG}"
-                    echo "Building Docker image: ${imageFull}"
-                    sh """
-                        docker build --pull --no-cache -t ${imageFull} .
-                        docker push ${imageFull}
-                    """
-                    sh "docker logout"
-                }
-            }
+    post {
+        success {
+            echo "Deployed ${env.TAG_NAME ?: 'n/a'} to ${env.DEPLOY_ENV ?: 'n/a'}"
+        }
+        not_built {
+            echo "Skipped: non-tag ref (${env.BRANCH_NAME}), no build/deploy performed."
+        }
+        failure {
+            echo "Failed for ${env.TAG_NAME ?: env.BRANCH_NAME}"
         }
     }
 }
