@@ -6,10 +6,9 @@ pipeline {
         timeout(time: 60, unit: 'MINUTES')
     }
     environment {
-        GIT_REPO              = "https://github.com/prophaze-tech/api-discovery-ml.git"
+        GIT_REPO              = "https://github.com/AnandR1225/hello-world.git"
         GIT_CREDENTIALS_ID    = "github1"
-        DOCKER_CREDENTIALS_ID = "prophaze-docker"
-        IMAGE_NAME            = "prophazedocker/ml-api-discovery"
+
     }
     triggers {
         githubPush()
