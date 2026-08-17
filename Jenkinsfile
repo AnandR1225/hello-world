@@ -21,6 +21,11 @@ pipeline {
         booleanParam(name: 'ROLLBACK', defaultValue: false, description: 'Rollback to TARGET_VERSION instead of deploy')
         string(name: 'TARGET_VERSION', defaultValue: '', description: 'Target Docker tag for rollback (if enabled)')
     }
+    // githubPush() still fires on every push (branches AND tags).
+    // The branch spec 'refs/tags/*' in the checkout below is what actually
+    // filters this out: a plain branch push (e.g. a PR merge to staging)
+    // will NOT match that spec, so Jenkins won't check anything out or build.
+    // Only an actual `git push origin <tag>` matches and triggers a real build.
     triggers {
         githubPush()
     }
@@ -31,15 +36,19 @@ pipeline {
         stage('Checkout Code') {
             steps {
                 script {
-                    echo ":small_blue_diamond: Checking out branch: master"
-                    checkout([$class: 'GitSCM',
-                        branches: [[name: "*/staging"]],
+                    echo ":small_blue_diamond: Checking out pushed tag"
+                    def scmVars = checkout([$class: 'GitSCM',
+                        branches: [[name: 'refs/tags/*']],
                         userRemoteConfigs: [[
                             url: env.GIT_REPO,
-                            credentialsId: env.GIT_CREDENTIALS_ID
+                            credentialsId: env.GIT_CREDENTIALS_ID,
+                            // Explicit refspec ensures tags are actually fetched
+                            // into refs/remotes/origin/tags/* so the branch spec above can match them.
+                            refspec: '+refs/tags/*:refs/remotes/origin/tags/*'
                         ]]
                     ])
-                    env.ACTUAL_BRANCH = "staging"
+                    // scmVars.GIT_BRANCH looks like "origin/tags/v1.2.11-rc1" for a tag checkout
+                    env.ACTUAL_REF = scmVars.GIT_BRANCH
                 }
             }
         }
@@ -48,7 +57,7 @@ pipeline {
                 echo """
                 Environment Info
                 ----------------------
-                Branch: ${env.ACTUAL_BRANCH}
+                Checked out ref: ${env.ACTUAL_REF}
                 Deploy: ${env.DEPLOY_ENV}
                 Repo:   ${env.IMAGE_NAME}
                 Namespace: ${env.NAMESPACE}
@@ -67,14 +76,12 @@ pipeline {
                         }
                         imageTag = params.TARGET_VERSION.trim()
                     } else {
-                        def tagName = sh(
-                            script: "git describe --tags --exact-match HEAD 2>/dev/null || true",
-                            returnStdout: true
-                        ).trim()
-                        if (!tagName) {
-                          error("Tag not found. Stopping build.")
+                        // Because we only ever check out refs/tags/*, this ref
+                        // is guaranteed to be a tag if the pipeline got this far.
+                        if (!env.ACTUAL_REF || !env.ACTUAL_REF.contains('tags/')) {
+                            error("No tag was checked out. This pipeline only builds on tag pushes.")
                         }
-                        imageTag = tagName
+                        imageTag = env.ACTUAL_REF.tokenize('/').last()
                     }
                     env.IMAGE_TAG = imageTag
                     echo ":rocket: FINAL Docker Tag: ${env.IMAGE_TAG}"
@@ -83,6 +90,3 @@ pipeline {
         }
     }
 }
-
-
-// testing jenkinsfile
