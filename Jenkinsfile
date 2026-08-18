@@ -12,6 +12,7 @@ pipeline {
         DOCKER_REPO           = "prophazedocker/ml-api-discovery"
         DOCKER_CREDENTIALS_ID = "prophaze-docker"
         KUBE_CRED             = "ml-api"
+
         NAMESPACE             = "ml-api-discovery-staging"
         SOURCE_BRANCH         = "staging"
         AWS_REGION            = "ap-south-1"
@@ -25,39 +26,42 @@ pipeline {
 
         stage('Checkout') {
             steps {
-                withEnv(['GIT_LFS_SKIP_SMUDGE=1']) {
-                    checkout scm
-                }
-                sh 'git log -1 --oneline'
+                checkout scm
+
+                sh '''
+                    git log -1 --oneline
+                    git tag --points-at HEAD || true
+                '''
             }
         }
 
-        stage('Validate Staging Tag') {
+        stage('Validate Tag') {
             steps {
                 script {
                     def tagName = sh(
-                        script: "git tag --points-at HEAD | head -n 1",
+                        script: 'git tag --points-at HEAD | head -n 1',
                         returnStdout: true
                     ).trim()
 
-                    if (!tagName && env.TAG_NAME?.trim()) {
-                        tagName = env.TAG_NAME.trim()
-                    }
-
                     if (!tagName) {
-                        error("No Git tag found. This pipeline only runs from staging RC tags.")
+                        error("No Git tag found. This pipeline requires a staging RC tag.")
                     }
 
-                    // Only allow staging RC tags, e.g. v1.2.22-rc1
                     if (!(tagName ==~ /^v\d+\.\d+\.\d+-rc\d+$/)) {
-                        error("Invalid staging tag '${tagName}'. Expected format: vX.Y.Z-rcN")
+                        error(
+                            "Invalid tag '${tagName}'. " +
+                            "Expected format: vX.Y.Z-rcN, e.g. v1.2.22-rc1"
+                        )
                     }
 
                     env.RELEASE_TAG = tagName
-                    env.IMAGE_TAG   = tagName
-                    env.TAG_COMMIT  = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                    env.IMAGE_TAG = tagName
+                    env.TAG_COMMIT = sh(
+                        script: 'git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
 
-                    echo "Release tag: ${env.RELEASE_TAG} (commit ${env.TAG_COMMIT}) -> namespace ${env.NAMESPACE}"
+                    echo "Staging tag: ${env.RELEASE_TAG}"
                 }
             }
         }
@@ -65,120 +69,183 @@ pipeline {
         stage('Validate Staging Branch') {
             steps {
                 script {
-                    sh "git fetch origin staging:refs/remotes/origin/staging"
+                    sh '''
+                        git fetch origin \
+                            staging:refs/remotes/origin/staging
+                    '''
 
                     def result = sh(
-                        script: "git merge-base --is-ancestor ${env.TAG_COMMIT} origin/staging",
+                        script: """
+                            git merge-base \
+                                --is-ancestor \
+                                ${env.TAG_COMMIT} \
+                                origin/staging
+                        """,
                         returnStatus: true
                     )
 
                     if (result != 0) {
-                        error("Tag ${env.RELEASE_TAG} does not belong to the staging branch history. Deployment stopped.")
+                        error(
+                            "Tag ${env.RELEASE_TAG} does not belong " +
+                            "to the staging branch. Deployment stopped."
+                        )
                     }
 
-                    echo "Tag ${env.RELEASE_TAG} verified against staging branch."
+                    echo "Tag belongs to staging branch."
                 }
             }
         }
 
-        stage('Docker Login') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: DOCKER_CREDENTIALS_ID,
-                    usernameVariable: 'DOCKER_USER',
-                    passwordVariable: 'DOCKER_PASSWORD'
-                )]) {
-                    sh 'echo "$DOCKER_PASSWORD" | docker login --username "$DOCKER_USER" --password-stdin'
-                }
-            }
-        }
+    //     stage('Docker Login') {
+    //         steps {
+    //             withCredentials([
+    //                 usernamePassword(
+    //                     credentialsId: DOCKER_CREDENTIALS_ID,
+    //                     usernameVariable: 'DOCKER_USER',
+    //                     passwordVariable: 'DOCKER_PASSWORD'
+    //                 )
+    //             ]) {
+    //                 sh '''
+    //                     echo "$DOCKER_PASSWORD" |
+    //                         docker login \
+    //                         --username "$DOCKER_USER" \
+    //                         --password-stdin
+    //                 '''
+    //             }
+    //         }
+    //     }
 
-        stage('Build & Push API') {
-            steps {
-                script {
-                    env.API_IMAGE = "${DOCKER_REPO}:api-${IMAGE_TAG}"
-                }
-                sh '''
-                    set -e
-                    docker build --pull -t "$API_IMAGE" .
-                '''
-            }
-        }
+    //     stage('Build & Push API') {
+    //         steps {
+    //             script {
+    //                 env.API_IMAGE = "${DOCKER_REPO}:api-${IMAGE_TAG}"
+    //             }
 
-        // stage('Build & Push Tokenizer') {
-        //     steps {
-        //         script {
-        //             env.TOKENIZER_IMAGE = "${DOCKER_REPO}:tokenizer-${IMAGE_TAG}"
-        //         }
-        //         withCredentials([
-        //             string(credentialsId: 'Access-key', variable: 'AWS_ACCESS_KEY_ID'),
-        //             string(credentialsId: 'Secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-        //         ]) {
-        //             sh '''
-        //                 set -e
-        //                 docker build --pull \
-        //                     --build-arg AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
-        //                     --build-arg AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-        //                     --build-arg AWS_DEFAULT_REGION="$AWS_REGION" \
-        //                     -t "$TOKENIZER_IMAGE" \
-        //                     api_discovery/tokenizer/
-        //                 docker push "$TOKENIZER_IMAGE"
-        //             '''
-        //         }
-        //     }
-        // }
+    //             sh '''
+    //                 docker build \
+    //                     --pull \
+    //                     -t "$API_IMAGE" \
+    //                     api_discovery/api_discovery_v1/
 
-        // stage('Deploy API') {
-        //     steps {
-        //         withKubeConfig(credentialsId: KUBE_CRED) {
-        //             sh '''
-        //                 set -e
-        //                 kubectl apply -f api_discovery/api_discovery_v1/deployment/fastapi.yaml -n "$NAMESPACE"
-        //                 kubectl apply -f api_discovery/api_discovery_v1/deployment/celery.yaml -n "$NAMESPACE"
-        //                 kubectl set image deployment/fastapi-app fastapi="$API_IMAGE" -n "$NAMESPACE"
-        //                 kubectl set image deployment/celery-worker celery="$API_IMAGE" -n "$NAMESPACE"
-        //                 kubectl rollout status deployment/fastapi-app -n "$NAMESPACE" --timeout=5m
-        //                 kubectl rollout status deployment/celery-worker -n "$NAMESPACE" --timeout=5m
-        //             '''
-        //         }
-        //     }
-        // }
+    //                 // docker push "$API_IMAGE"
+    //             '''
+    //         }
+    //     }
 
-        // stage('Deploy Tokenizer') {
-        //     steps {
-        //         withKubeConfig(credentialsId: KUBE_CRED) {
-        //             sh '''
-        //                 set -e
-        //                 kubectl apply -f api_discovery/tokenizer/deployment/tokenizer.yaml -n "$NAMESPACE"
-        //                 kubectl set image deployment/tokenizer tokenizer="$TOKENIZER_IMAGE" -n "$NAMESPACE"
-        //                 kubectl rollout status deployment/tokenizer -n "$NAMESPACE" --timeout=5m
-        //             '''
-        //         }
-        //     }
-        // }
+    //     stage('Build & Push Tokenizer') {
+    //         steps {
+    //             script {
+    //                 env.TOKENIZER_IMAGE =
+    //                     "${DOCKER_REPO}:tokenizer-${IMAGE_TAG}"
+    //             }
 
-        // stage('Verify Deployment') {
-        //     steps {
-        //         withKubeConfig(credentialsId: KUBE_CRED) {
-        //             sh '''
-        //                 kubectl get deployments -n "$NAMESPACE"
-        //                 kubectl get pods -n "$NAMESPACE"
-        //             '''
-        //         }
-        //     }
-        // }
-    }
+    //             withCredentials([
+    //                 string(
+    //                     credentialsId: 'Access-key',
+    //                     variable: 'AWS_ACCESS_KEY_ID'
+    //                 ),
+    //                 string(
+    //                     credentialsId: 'Secret-access-key',
+    //                     variable: 'AWS_SECRET_ACCESS_KEY'
+    //                 )
+    //             ]) {
+    //                 sh '''
+    //                     docker build \
+    //                         --pull \
+    //                         --build-arg AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+    //                         --build-arg AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+    //                         --build-arg AWS_DEFAULT_REGION="$AWS_REGION" \
+    //                         -t "$TOKENIZER_IMAGE" \
+    //                         api_discovery/tokenizer/
 
-    post {
-        success {
-            echo "Staging deploy OK — tag ${env.RELEASE_TAG ?: 'N/A'}, build ${env.BUILD_NUMBER}, api=${env.API_IMAGE ?: 'N/A'}, tokenizer=${env.TOKENIZER_IMAGE ?: 'N/A'}"
-        }
-        failure {
-            echo "Staging deploy FAILED — tag ${env.RELEASE_TAG ?: 'N/A'}, build ${env.BUILD_NUMBER}, ${env.BUILD_URL}"
-        }
-        always {
-            sh 'docker logout 2>/dev/null || true'
-            cleanWs()
-        }
+    //                     docker push "$TOKENIZER_IMAGE"
+    //                 '''
+    //             }
+    //         }
+    //     }
+
+    //     stage('Deploy API') {
+    //         steps {
+    //             withKubeConfig(credentialsId: KUBE_CRED) {
+    //                 sh '''
+    //                     kubectl apply \
+    //                         -f api_discovery/api_discovery_v1/deployment/fastapi.yaml \
+    //                         -n "$NAMESPACE"
+
+    //                     kubectl apply \
+    //                         -f api_discovery/api_discovery_v1/deployment/celery.yaml \
+    //                         -n "$NAMESPACE"
+
+    //                     kubectl set image \
+    //                         deployment/fastapi-app \
+    //                         fastapi="$API_IMAGE" \
+    //                         -n "$NAMESPACE"
+
+    //                     kubectl set image \
+    //                         deployment/celery-worker \
+    //                         celery="$API_IMAGE" \
+    //                         -n "$NAMESPACE"
+
+    //                     kubectl rollout status \
+    //                         deployment/fastapi-app \
+    //                         -n "$NAMESPACE" \
+    //                         --timeout=5m
+
+    //                     kubectl rollout status \
+    //                         deployment/celery-worker \
+    //                         -n "$NAMESPACE" \
+    //                         --timeout=5m
+    //                 '''
+    //             }
+    //         }
+    //     }
+
+    //     stage('Deploy Tokenizer') {
+    //         steps {
+    //             withKubeConfig(credentialsId: KUBE_CRED) {
+    //                 sh '''
+    //                     kubectl apply \
+    //                         -f api_discovery/tokenizer/deployment/tokenizer.yaml \
+    //                         -n "$NAMESPACE"
+
+    //                     kubectl set image \
+    //                         deployment/tokenizer \
+    //                         tokenizer="$TOKENIZER_IMAGE" \
+    //                         -n "$NAMESPACE"
+
+    //                     kubectl rollout status \
+    //                         deployment/tokenizer \
+    //                         -n "$NAMESPACE" \
+    //                         --timeout=5m
+    //                 '''
+    //             }
+    //         }
+    //     }
+
+    //     stage('Verify Deployment') {
+    //         steps {
+    //             withKubeConfig(credentialsId: KUBE_CRED) {
+    //                 sh '''
+    //                     kubectl get deployments -n "$NAMESPACE"
+    //                     kubectl get pods -n "$NAMESPACE"
+    //                 '''
+    //             }
+    //         }
+    //     }
+    // }
+
+    // post {
+    //     success {
+    //         echo "Staging deployment successful: ${env.RELEASE_TAG}"
+    //     }
+
+    //     failure {
+    //         echo "Staging deployment failed: ${env.RELEASE_TAG ?: 'unknown'}"
+    //     }
+
+    //     always {
+    //         sh 'docker logout 2>/dev/null || true'
+    //         cleanWs()
+    //     }
     }
 }
