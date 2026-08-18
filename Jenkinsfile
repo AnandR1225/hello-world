@@ -100,7 +100,7 @@ pipeline {
                 }
                 sh '''
                     set -e
-                    docker build --pull -t "$API_IMAGE" api_discovery/api_discovery_v1/
+                    docker build --pull -t "$API_IMAGE" .
                 '''
             }
         }
