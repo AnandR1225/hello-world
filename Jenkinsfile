@@ -12,7 +12,7 @@ pipeline {
         GIT_REPO           = "https://github.com/AnandR1225/hello-world.git"
         GIT_CREDENTIALS_ID = "github1"
 
-        // Uncomment these when you enable the actual deployment
+        // Enable these when you add actual Docker/Kubernetes deployment
         // DOCKER_CREDENTIALS_ID       = "docker-report"
         // SONARQUBE_ENV               = "sonar-server"
         // NAMESPACE                   = "reports"
@@ -39,73 +39,182 @@ pipeline {
 
     stages {
 
+        /*
+         * ============================================================
+         * CLEAN WORKSPACE
+         * ============================================================
+         */
+
         stage('Clean Workspace') {
             steps {
                 cleanWs()
             }
         }
 
+        /*
+         * ============================================================
+         * CHECKOUT
+         * ============================================================
+         */
+
         stage('Checkout Tag') {
             steps {
-                checkout scm
+                script {
 
-                sh '''
-                    echo "===== Git Information ====="
-                    git status
-                    git branch --show-current
-                    git log -1 --oneline
-                    echo "==========================="
-                '''
+                    echo "Checking out source using Jenkins SCM configuration..."
+
+                    checkout scm
+
+                    sh '''
+                        echo "=========================================="
+                        echo "Git Information"
+                        echo "=========================================="
+
+                        git status
+
+                        echo ""
+                        echo "Current commit:"
+                        git log -1 --oneline
+
+                        echo ""
+                        echo "Git tags pointing to HEAD:"
+                        git tag --points-at HEAD || true
+
+                        echo "=========================================="
+                    '''
+                }
             }
         }
+
+        /*
+         * ============================================================
+         * VALIDATE TAG
+         * ============================================================
+         */
 
         stage('Validate Tag') {
             steps {
                 script {
 
+                    /*
+                     * Jenkins may provide TAG_NAME when the build
+                     * is triggered as a tag build.
+                     *
+                     * We still use git describe as a fallback because
+                     * it verifies the actual checked-out commit.
+                     */
+
                     def tagName = env.TAG_NAME?.trim()
 
                     if (!tagName) {
                         tagName = sh(
-                            script: "git describe --tags --exact-match HEAD 2>/dev/null || true",
+                            script: '''
+                                git describe \
+                                --tags \
+                                --exact-match \
+                                HEAD \
+                                2>/dev/null || true
+                            ''',
                             returnStdout: true
                         ).trim()
                     }
 
+                    /*
+                     * No tag = do not continue.
+                     */
+
                     if (!tagName) {
-                        error("No Git tag found. This pipeline is intended to run from a v* tag.")
+                        error """
+                        No Git tag was found on the checked-out commit.
+
+                        This Jenkins pipeline is configured for
+                        Git tag based deployments only.
+
+                        Expected example:
+                        v1.0.0
+                        """
                     }
 
+                    /*
+                     * Only v* tags are allowed.
+                     */
+
                     if (!(tagName ==~ /^v.*/)) {
-                        error("Invalid tag '${tagName}'. Expected a tag starting with 'v'.")
+                        error """
+                        Invalid Git tag: '${tagName}'
+
+                        Production tags must start with 'v'.
+
+                        Valid examples:
+                        v1.0.0
+                        v1.0.1
+                        v1.1.0
+                        """
                     }
+
+                    /*
+                     * Store the validated release tag.
+                     */
 
                     env.RELEASE_TAG = tagName
 
-                    echo "Git Release Tag: ${env.RELEASE_TAG}"
+                    echo """
+                    ==========================================
+                    TAG VALIDATION SUCCESSFUL
+                    ==========================================
+
+                    Git Release Tag: ${env.RELEASE_TAG}
+
+                    ==========================================
+                    """
                 }
             }
         }
 
+        /*
+         * ============================================================
+         * ENVIRONMENT INFORMATION
+         * ============================================================
+         */
+
         stage('Environment Info') {
             steps {
                 echo """
-                ==============================
+                ==========================================
                 Environment Information
-                ==============================
+                ==========================================
 
-                Tag:               ${env.RELEASE_TAG}
-                Deploy Environment: ${env.DEPLOY_ENV ?: 'Not configured'}
-                Repository:         ${env.GIT_REPO}
-                Image:              ${env.IMAGE_NAME ?: 'Not configured'}
-                Namespace:          ${env.NAMESPACE ?: 'Not configured'}
-                Deployment File:    ${env.DEPLOYMENT_FILE ?: 'Not configured'}
-                Deployment Name:    ${env.DEPLOYMENT_NAME ?: 'Not configured'}
+                Repository:
+                ${env.GIT_REPO}
 
-                ==============================
+                Release Tag:
+                ${env.RELEASE_TAG}
+
+                Deploy Environment:
+                ${env.DEPLOY_ENV ?: 'Not configured'}
+
+                Docker Image:
+                ${env.IMAGE_NAME ?: 'Not configured'}
+
+                Namespace:
+                ${env.NAMESPACE ?: 'Not configured'}
+
+                Deployment File:
+                ${env.DEPLOYMENT_FILE ?: 'Not configured'}
+
+                Deployment Name:
+                ${env.DEPLOYMENT_NAME ?: 'Not configured'}
+
+                ==========================================
                 """
             }
         }
+
+        /*
+         * ============================================================
+         * GENERATE DOCKER TAG
+         * ============================================================
+         */
 
         stage('Generate Docker Tag') {
             steps {
@@ -123,15 +232,42 @@ pipeline {
 
                         imageTag = params.TARGET_VERSION.trim()
 
-                        echo "Rollback requested."
-                        echo "Rollback Docker Tag: ${imageTag}"
+                        /*
+                         * Validate rollback version.
+                         */
+
+                        if (!(imageTag ==~ /^v.*/)) {
+                            error(
+                                "Invalid rollback version '${imageTag}'. " +
+                                "Rollback versions must start with 'v'."
+                            )
+                        }
+
+                        echo """
+                        ==========================================
+                        ROLLBACK
+                        ==========================================
+
+                        Rollback Docker Tag:
+                        ${imageTag}
+
+                        ==========================================
+                        """
 
                     } else {
 
                         imageTag = env.RELEASE_TAG
 
-                        echo "Normal release deployment."
-                        echo "Release Docker Tag: ${imageTag}"
+                        echo """
+                        ==========================================
+                        RELEASE DEPLOYMENT
+                        ==========================================
+
+                        Release Docker Tag:
+                        ${imageTag}
+
+                        ==========================================
+                        """
                     }
 
                     env.IMAGE_TAG = imageTag
@@ -141,70 +277,146 @@ pipeline {
             }
         }
 
+        /*
+         * ============================================================
+         * BUILD
+         * ============================================================
+         */
+
         stage('Build') {
             when {
-                not {
-                    expression {
-                        params.ROLLBACK
-                    }
+                expression {
+                    return !params.ROLLBACK
                 }
             }
 
             steps {
-                echo "Building Docker image with tag: ${env.IMAGE_TAG}"
+                script {
 
-                // Add your Docker build command here
-                // sh "docker build -t ${env.IMAGE_NAME}:${env.IMAGE_TAG} ."
+                    echo """
+                    ==========================================
+                    BUILD
+                    ==========================================
+
+                    Git Tag:
+                    ${env.RELEASE_TAG}
+
+                    Docker Tag:
+                    ${env.IMAGE_TAG}
+
+                    ==========================================
+                    """
+
+                    /*
+                     * Add your actual build command here.
+                     *
+                     * Example:
+                     *
+                     * sh """
+                     *     docker build \
+                     *       -t ${env.IMAGE_NAME}:${env.IMAGE_TAG} .
+                     * """
+                     */
+
+                    echo "Build stage completed."
+                }
             }
         }
+
+        /*
+         * ============================================================
+         * TEST
+         * ============================================================
+         */
 
         stage('Test') {
             steps {
-                echo "Running tests for tag: ${env.RELEASE_TAG}"
 
-                // Add your test commands here
-                // sh 'make check'
+                echo """
+                ==========================================
+                TEST
+                ==========================================
+
+                Testing release:
+                ${env.RELEASE_TAG}
+
+                ==========================================
+                """
+
+                /*
+                 * Add your test commands here.
+                 *
+                 * Example:
+                 *
+                 * sh 'make check'
+                 */
+
+                echo "Test stage completed."
             }
         }
 
+        /*
+         * ============================================================
+         * PRODUCTION DEPLOYMENT
+         * ============================================================
+         */
+
         stage('Deploy Production') {
+
             when {
                 tag "v*"
             }
 
             steps {
-                echo "=========================================="
-                echo "Deploying Production"
-                echo "Git Tag:     ${env.RELEASE_TAG}"
-                echo "Docker Tag:  ${env.IMAGE_TAG}"
-                echo "=========================================="
+                script {
 
-                // Add your deployment commands here
+                    echo """
+                    ==========================================
+                    PRODUCTION DEPLOYMENT
+                    ==========================================
 
-                // Example:
-                // sh """
-                //     kubectl -n ${env.NAMESPACE} \
-                //       set image deployment/${env.DEPLOYMENT_NAME} \
-                //       ${env.DEPLOYMENT_NAME}=${env.IMAGE_NAME}:${env.IMAGE_TAG}
-                // """
+                    Git Tag:
+                    ${env.RELEASE_TAG}
+
+                    Docker Tag:
+                    ${env.IMAGE_TAG}
+
+                    Environment:
+                    ${env.DEPLOY_ENV ?: 'Not configured'}
+
+                    Namespace:
+                    ${env.NAMESPACE ?: 'Not configured'}
+
+                    ==========================================
+                    """
+
+                    /*
+                     * Add your actual deployment commands here.
+                     *
+                     * Example:
+                     *
+                     * withKubeConfig(
+                     *     credentialsId:
+                     *         env.KUBERNETES_CREDENTIALS_ID
+                     * ) {
+                     *
+                     *     sh """
+                     *         kubectl -n ${env.NAMESPACE} \
+                     *           set image \
+                     *           deployment/${env.DEPLOYMENT_NAME} \
+                     *           ${env.DEPLOYMENT_NAME}=\
+                     *           ${env.IMAGE_NAME}:${env.IMAGE_TAG}
+                     *
+                     *         kubectl -n ${env.NAMESPACE} \
+                     *           rollout status \
+                     *           deployment/${env.DEPLOYMENT_NAME}
+                     *     """
+                     * }
+                     */
+
+                    echo "Production deployment stage completed."
+                }
             }
-        }
-    }
-
-    post {
-        success {
-            echo "Pipeline completed successfully."
-            echo "Release Tag: ${env.RELEASE_TAG}"
-            echo "Docker Tag:  ${env.IMAGE_TAG}"
-        }
-
-        failure {
-            echo "Pipeline failed."
-        }
-
-        always {
-            echo "Cleaning workspace..."
-            cleanWs()
         }
     }
 }
