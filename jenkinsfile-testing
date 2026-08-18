@@ -1,83 +1,393 @@
 pipeline {
     agent any
+
     options {
+        skipDefaultCheckout()
         disableConcurrentBuilds()
         timestamps()
         timeout(time: 60, unit: 'MINUTES')
     }
+
     environment {
-        GIT_REPO               = "https://github.com/AnandR1225/hello-world.git"
-        GIT_CREDENTIALS_ID     = "github1"
-        // DOCKER_CREDENTIALS_ID  = "docker-report"
-        // SONARQUBE_ENV          = "sonar-server"
-        // NAMESPACE              = "reports"
-        // DEPLOY_ENV             = "production"
-        // IMAGE_NAME             = "prophazedocker/i-report"
-        // KUBERNETES_CREDENTIALS_ID = "k3s-report-staging"
-        // DEPLOYMENT_FILE        = "prod-reports.yaml"
-        // DEPLOYMENT_NAME        = "prod-reports-api"
+        DOCKER_REPO           = "prophazedocker/ml-api-discovery"
+        DOCKER_CREDENTIALS_ID = "prophaze-docker"
+        KUBE_CRED             = "ml-api"
+        NAMESPACE             = "ml-api-discovery-prod"
+        SOURCE_BRANCH         = "staging"
+        AWS_REGION            = "ap-south-1"
     }
-    parameters {
-        booleanParam(name: 'ROLLBACK', defaultValue: false, description: 'Rollback to TARGET_VERSION instead of deploy')
-        string(name: 'TARGET_VERSION', defaultValue: '', description: 'Target Docker tag for rollback (if enabled)')
-    }
+
     triggers {
         githubPush()
     }
+
     stages {
-        stage('Clean Workspace') {
-            steps { cleanWs() }
-        }
-        stage('Checkout Code') {
+
+        stage('Checkout') {
             steps {
-                script {
-                    echo ":small_blue_diamond: Checking out branch: master"
-                    checkout([$class: 'GitSCM',
-                        branches: [[name: "*/staging"]],
-                        userRemoteConfigs: [[
-                            url: env.GIT_REPO,
-                            credentialsId: env.GIT_CREDENTIALS_ID
-                        ]]
-                    ])
-                    env.ACTUAL_BRANCH = "staging"
+                withEnv(['GIT_LFS_SKIP_SMUDGE=1']) {
+                    checkout scm
                 }
-            }
-        }
-        stage('Environment Info') {
-            steps {
-                echo """
-                Environment Info
-                ----------------------
-                Branch: ${env.ACTUAL_BRANCH}
-                Deploy: ${env.DEPLOY_ENV}
-                Repo:   ${env.IMAGE_NAME}
-                Namespace: ${env.NAMESPACE}
-                Deployment File: ${env.DEPLOYMENT_FILE}
-                """
+
+                sh '''
+                    set -e
+
+                    echo "=========================================="
+                    echo "Git Information"
+                    echo "=========================================="
+
+                    git log -1 --oneline
+                    git rev-parse HEAD
+
+                    echo ""
+                    echo "Tags on current commit:"
+                    git tag --points-at HEAD || true
+
+                    echo "=========================================="
+                '''
             }
         }
 
-        stage('Generate Docker Tag') {
+        stage('Validate Production Tag') {
             steps {
                 script {
-                    def imageTag = ""
-                    if (params.ROLLBACK) {
-                        if (!params.TARGET_VERSION?.trim()) {
-                            error("Rollback requested but no TARGET_VERSION provided.")
-                        }
-                        imageTag = params.TARGET_VERSION.trim()
+
+                    def tagName = sh(
+                        script: '''
+                            git tag --points-at HEAD | head -n 1
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    if (!tagName && env.TAG_NAME?.trim()) {
+                        tagName = env.TAG_NAME.trim()
+                    }
+
+                    if (!tagName) {
+                        error("No Git tag found. Production deployments require a version tag.")
+                    }
+
+                    if (!(tagName ==~ /^v\d+\.\d+\.\d+$/)) {
+                        error(
+                            "Invalid production tag '${tagName}'. " +
+                            "Expected format: vX.Y.Z, for example v1.2.0"
+                        )
+                    }
+
+                    env.RELEASE_TAG = tagName
+                    env.IMAGE_TAG   = tagName
+                    env.TAG_COMMIT  = sh(
+                        script: 'git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+
+        stage('Validate Main Source') {
+            steps {
+                script {
+
+                    sh '''
+                        set -e
+
+                        git fetch origin \
+                            main:refs/remotes/origin/main
+                    '''
+
+                    def mainCommit = sh(
+                        script: 'git rev-parse origin/main',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Main HEAD: ${mainCommit}"
+                    echo "Tagged commit: ${env.TAG_COMMIT}"
+
+                    def result = sh(
+                        script: """
+                            git merge-base \
+                                --is-ancestor \
+                                ${env.TAG_COMMIT} \
+                                origin/main
+                        """,
+                        returnStatus: true
+                    )
+
+                    if (result != 0) {
+                        error(
+                            "Production tag ${env.RELEASE_TAG} does not " +
+                            "belong to the main branch history."
+                        )
+                    }
+
+                    echo "Production source validation passed."
+                }
+            }
+        }
+
+        stage('Detect Changed Services') {
+            steps {
+                script {
+
+                    sh '''
+                        set -e
+                        git fetch --tags --force
+                    '''
+                    def previousTag = sh(
+                        script: """
+                            git tag --sort=-creatordate \
+                                --list 'v[0-9]*.[0-9]*.[0-9]*' \
+                                | grep -Fxv '${env.RELEASE_TAG}' \
+                                | grep -E '^v[0-9]+\\.[0-9]+\\.[0-9]+$' \
+                                | head -n 1 || true
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def baseRef
+
+                    if (previousTag) {
+
+                        baseRef = previousTag
+
+                        echo "Previous production tag: ${previousTag}"
+
                     } else {
-                        def tagName = sh(
-                            script: "git describe --tags --exact-match HEAD 2>/dev/null || true",
+
+                        baseRef = sh(
+                            script: "git rev-list --max-parents=0 ${env.RELEASE_TAG}",
                             returnStdout: true
                         ).trim()
-                        if (!tagName) {
-                          error("Tag not found. Stopping build.")
-                        }
-                        imageTag = tagName
+
+                        echo "No previous production tag found."
+                        echo "Using initial commit: ${baseRef}"
                     }
-                    env.IMAGE_TAG = imageTag
-                    echo ":rocket: FINAL Docker Tag: ${env.IMAGE_TAG}"
+
+                    def changedFiles = sh(
+                        script: """
+                            git diff \
+                                --name-only \
+                                ${baseRef} \
+                                ${env.RELEASE_TAG}
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    env.BUILD_API = changedFiles.contains(
+                        "api_discovery/api_discovery_v1/"
+                    ) ? "true" : "false"
+
+                    env.BUILD_TOKENIZER = changedFiles.contains(
+                        "api_discovery/tokenizer/"
+                    ) ? "true" : "false"
+
+                    if (
+                        env.BUILD_API != "true" &&
+                        env.BUILD_TOKENIZER != "true"
+                    ) {
+                        error(
+                            "No API or Tokenizer changes detected. " +
+                            "Nothing to deploy."
+                        )
+                    }
+
+                    echo "BUILD_API=${env.BUILD_API}"
+                    echo "BUILD_TOKENIZER=${env.BUILD_TOKENIZER}"
+                }
+            }
+        }
+
+        stage('Docker Login') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: DOCKER_CREDENTIALS_ID,
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        echo "$DOCKER_PASSWORD" |
+                            docker login \
+                                --username "$DOCKER_USER" \
+                                --password-stdin
+                    '''
+                }
+            }
+        }
+
+        stage('Build & Push API') {
+            when {
+                expression {
+                    env.BUILD_API == "true"
+                }
+            }
+
+            steps {
+                script {
+                    env.API_IMAGE =
+                        "${DOCKER_REPO}:api-${IMAGE_TAG}"
+                }
+
+                sh '''
+                    set -e
+
+                    echo "Building API:"
+                    echo "$API_IMAGE"
+
+                    docker build \
+                        --pull \
+                        -t "$API_IMAGE" \
+                        api_discovery/api_discovery_v1/
+
+                    docker push "$API_IMAGE"
+                '''
+            }
+        }
+
+        stage('Build & Push Tokenizer') {
+            when {
+                expression {
+                    env.BUILD_TOKENIZER == "true"
+                }
+            }
+
+            steps {
+                script {
+                    env.TOKENIZER_IMAGE =
+                        "${DOCKER_REPO}:tokenizer-${IMAGE_TAG}"
+                }
+                withCredentials([
+                    string(
+                        credentialsId: 'Access-key',
+                        variable: 'AWS_ACCESS_KEY_ID'
+                    ),
+                    string(
+                        credentialsId: 'Secret-access-key',
+                        variable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+
+                    sh '''
+                        set -e
+
+                        echo "Building Tokenizer:"
+                        echo "$TOKENIZER_IMAGE"
+
+                        docker build \
+                            --pull \
+                            --build-arg AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+                            --build-arg AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+                            --build-arg AWS_DEFAULT_REGION="$AWS_REGION" \
+                            -t "$TOKENIZER_IMAGE" \
+                            api_discovery/tokenizer/
+
+                        docker push "$TOKENIZER_IMAGE"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Production') {
+            steps {
+                withKubeConfig(credentialsId: KUBE_CRED) {
+
+                    sh '''
+                        set -e
+
+                        if [ "$NAMESPACE" != "ml-api-discovery-prod" ]; then
+                            echo "ERROR: Invalid production namespace."
+                            exit 1
+                        fi
+
+                        echo "Deploying to:"
+                        echo "$NAMESPACE"
+                    '''
+
+                    script {
+
+                        if (env.BUILD_API == "true") {
+
+                            sh '''
+                                set -e
+
+                                kubectl apply \
+                                    -f api_discovery/api_discovery_v1/deployment/fastapi.yaml \
+                                    -n "$NAMESPACE"
+
+                                kubectl apply \
+                                    -f api_discovery/api_discovery_v1/deployment/celery.yaml \
+                                    -n "$NAMESPACE"
+
+                                kubectl set image \
+                                    deployment/fastapi-app \
+                                    fastapi="$API_IMAGE" \
+                                    -n "$NAMESPACE"
+
+                                kubectl set image \
+                                    deployment/celery-worker \
+                                    celery="$API_IMAGE" \
+                                    -n "$NAMESPACE"
+
+                                kubectl rollout status \
+                                    deployment/fastapi-app \
+                                    -n "$NAMESPACE" \
+                                    --timeout=5m
+
+                                kubectl rollout status \
+                                    deployment/celery-worker \
+                                    -n "$NAMESPACE" \
+                                    --timeout=5m
+                            '''
+                        }
+
+                        if (env.BUILD_TOKENIZER == "true") {
+
+                            sh '''
+                                set -e
+
+                                kubectl apply \
+                                    -f api_discovery/tokenizer/deployment/tokenizer.yaml \
+                                    -n "$NAMESPACE"
+
+                                kubectl set image \
+                                    deployment/tokenizer \
+                                    tokenizer="$TOKENIZER_IMAGE" \
+                                    -n "$NAMESPACE"
+
+                                kubectl rollout status \
+                                    deployment/tokenizer \
+                                    -n "$NAMESPACE" \
+                                    --timeout=5m
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                withKubeConfig(credentialsId: KUBE_CRED) {
+
+                    sh '''
+                        set -e
+
+                        echo "=========================================="
+                        echo "Production Deployment Verification"
+                        echo "=========================================="
+
+                        kubectl get pods \
+                            -n "$NAMESPACE"
+
+                        echo ""
+                        kubectl get deployments \
+                            -n "$NAMESPACE"
+
+                        echo "=========================================="
+                    '''
                 }
             }
         }
