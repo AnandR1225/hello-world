@@ -23,21 +23,13 @@ pipeline {
         // DEPLOYMENT_NAME             = "prod-reports-api"
     }
 
-    parameters {
-        booleanParam(
-            name: 'ROLLBACK',
-            defaultValue: false,
-            description: 'Rollback to TARGET_VERSION instead of deploying the current Git tag'
-        )
-
-        string(
-            name: 'TARGET_VERSION',
-            defaultValue: '',
-            description: 'Target Docker tag for rollback, e.g. v1.2.0'
-        )
-    }
-
     stages {
+
+        /*
+         * ============================================================
+         * CLEAN WORKSPACE
+         * ============================================================
+         */
 
         stage('Clean Workspace') {
             steps {
@@ -55,7 +47,16 @@ pipeline {
             steps {
                 script {
 
-                    echo "Checking out source from Jenkins SCM configuration..."
+                    echo "=========================================="
+                    echo "Checking out Git tag"
+                    echo "=========================================="
+
+                    /*
+                     * Jenkins SCM configuration determines which
+                     * tag triggered this build.
+                     *
+                     * Do NOT checkout master/staging manually here.
+                     */
 
                     checkout scm
 
@@ -68,7 +69,7 @@ pipeline {
                         git log -1 --oneline
 
                         echo ""
-                        echo "Current HEAD:"
+                        echo "HEAD:"
                         git rev-parse HEAD
 
                         echo ""
@@ -83,22 +84,32 @@ pipeline {
 
         /*
          * ============================================================
-         * VALIDATE TAG + STAGING BRANCH
+         * VALIDATE TAG
          * ============================================================
          */
 
-        stage('Validate Tag and Staging Source') {
+        stage('Validate Tag') {
             steps {
                 script {
 
                     /*
-                     * Get the Git tag.
+                     * Find the tag pointing to the checked-out commit.
                      *
-                     * TAG_NAME may be provided by Jenkins.
-                     * git describe is used as a fallback.
+                     * We intentionally don't depend only on TAG_NAME,
+                     * because TAG_NAME may not always be populated
+                     * depending on how Jenkins SCM is configured.
                      */
 
-                    def tagName = env.TAG_NAME?.trim()
+                    def tagName = sh(
+                        script: '''
+                            git tag --points-at HEAD | head -n 1
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    /*
+                     * Fallback
+                     */
 
                     if (!tagName) {
                         tagName = sh(
@@ -114,9 +125,7 @@ pipeline {
                     }
 
                     /*
-                     * ------------------------------------------------
-                     * Validate that a tag exists
-                     * ------------------------------------------------
+                     * No tag = stop
                      */
 
                     if (!tagName) {
@@ -127,9 +136,9 @@ pipeline {
 
                         No Git tag was found on the checked-out commit.
 
-                        This Jenkins job only accepts Git tags.
+                        This Jenkins pipeline accepts only Git tags.
 
-                        Example:
+                        Expected:
                         v1.0.0
 
                         ==========================================
@@ -137,9 +146,7 @@ pipeline {
                     }
 
                     /*
-                     * ------------------------------------------------
-                     * Validate tag format
-                     * ------------------------------------------------
+                     * Only v* tags are allowed
                      */
 
                     if (!(tagName ==~ /^v.*/)) {
@@ -163,130 +170,19 @@ pipeline {
                     }
 
                     /*
-                     * ------------------------------------------------
-                     * Get tagged commit
-                     * ------------------------------------------------
-                     */
-
-                    def tagCommit = sh(
-                        script: 'git rev-parse HEAD',
-                        returnStdout: true
-                    ).trim()
-
-                    echo """
-                    Git Tag:
-                    ${tagName}
-
-                    Tagged Commit:
-                    ${tagCommit}
-                    """
-
-                    /*
-                     * ------------------------------------------------
-                     * Fetch staging branch
-                     *
-                     * The Jenkins SCM refspec only fetches tags,
-                     * so we explicitly fetch staging here.
-                     * ------------------------------------------------
-                     */
-
-                    sh '''
-                        echo "Fetching staging branch..."
-
-                        git fetch origin \
-                            staging:refs/remotes/origin/staging
-                    '''
-
-                    /*
-                     * ------------------------------------------------
-                     * Get staging HEAD
-                     * ------------------------------------------------
-                     */
-
-                    def stagingCommit = sh(
-                        script: 'git rev-parse origin/staging',
-                        returnStdout: true
-                    ).trim()
-
-                    echo """
-                    ==========================================
-                    STAGING VALIDATION
-                    ==========================================
-
-                    Git Tag:
-                    ${tagName}
-
-                    Tagged Commit:
-                    ${tagCommit}
-
-                    Current Staging HEAD:
-                    ${stagingCommit}
-
-                    ==========================================
-                    """
-
-                    /*
-                     * ------------------------------------------------
-                     * Verify that the tagged commit belongs to
-                     * the staging branch.
-                     *
-                     * --is-ancestor means:
-                     *
-                     * tagged commit
-                     *       |
-                     *       v
-                     * staging history
-                     *
-                     * Therefore the tag must point to a commit
-                     * that exists in staging.
-                     * ------------------------------------------------
-                     */
-
-                    def isFromStaging = sh(
-                        script: """
-                            git merge-base \
-                                --is-ancestor \
-                                ${tagCommit} \
-                                origin/staging
-                        """,
-                        returnStatus: true
-                    )
-
-                    if (isFromStaging != 0) {
-                        error """
-                        ==========================================
-                        INVALID TAG SOURCE
-                        ==========================================
-
-                        Tag:
-                        ${tagName}
-
-                        Tagged Commit:
-                        ${tagCommit}
-
-                        Staging HEAD:
-                        ${stagingCommit}
-
-                        RESULT:
-                        The tagged commit is NOT part of the
-                        staging branch.
-
-                        This Jenkins pipeline only allows tags
-                        created from the staging branch.
-
-                        ==========================================
-                        """
-                    }
-
-                    /*
-                     * ------------------------------------------------
-                     * Validation successful
-                     * ------------------------------------------------
+                     * Save release tag
                      */
 
                     env.RELEASE_TAG = tagName
-                    env.TAG_COMMIT = tagCommit
-                    env.SOURCE_BRANCH = "staging"
+
+                    /*
+                     * Get tagged commit
+                     */
+
+                    env.TAG_COMMIT = sh(
+                        script: 'git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
 
                     echo """
                     ==========================================
@@ -296,10 +192,133 @@ pipeline {
                     Release Tag:
                     ${env.RELEASE_TAG}
 
+                    Tagged Commit:
+                    ${env.TAG_COMMIT}
+
+                    ==========================================
+                    """
+                }
+            }
+        }
+
+        /*
+         * ============================================================
+         * VALIDATE STAGING SOURCE
+         * ============================================================
+         */
+
+        stage('Validate Staging Source') {
+            steps {
+                script {
+
+                    echo "Fetching staging branch..."
+
+                    /*
+                     * Fetch staging only for validation.
+                     *
+                     * This does NOT change the checked-out tag.
+                     */
+
+                    sh '''
+                        git fetch origin \
+                            staging:refs/remotes/origin/staging
+                    '''
+
+                    /*
+                     * Get staging HEAD
+                     */
+
+                    def stagingCommit = sh(
+                        script: 'git rev-parse origin/staging',
+                        returnStdout: true
+                    ).trim()
+
+                    /*
+                     * Save for later stages
+                     */
+
+                    env.STAGING_COMMIT = stagingCommit
+
+                    echo """
+                    ==========================================
+                    STAGING VALIDATION
+                    ==========================================
+
+                    Release Tag:
+                    ${env.RELEASE_TAG}
+
+                    Tagged Commit:
+                    ${env.TAG_COMMIT}
+
+                    Staging HEAD:
+                    ${env.STAGING_COMMIT}
+
+                    ==========================================
+                    """
+
+                    /*
+                     * Check whether the tagged commit exists
+                     * in the staging branch history.
+                     *
+                     * This is better than comparing:
+                     *
+                     * tagCommit == stagingCommit
+                     *
+                     * because staging can move forward after
+                     * a release tag is created.
+                     */
+
+                    def stagingCheck = sh(
+                        script: """
+                            git merge-base \
+                                --is-ancestor \
+                                ${env.TAG_COMMIT} \
+                                origin/staging
+                        """,
+                        returnStatus: true
+                    )
+
+                    if (stagingCheck != 0) {
+
+                        error """
+                        ==========================================
+                        INVALID TAG SOURCE
+                        ==========================================
+
+                        Release Tag:
+                        ${env.RELEASE_TAG}
+
+                        Tagged Commit:
+                        ${env.TAG_COMMIT}
+
+                        Staging HEAD:
+                        ${env.STAGING_COMMIT}
+
+                        RESULT:
+                        The tagged commit does NOT exist in the
+                        staging branch history.
+
+                        Only tags created from commits belonging
+                        to the staging branch are allowed.
+
+                        ==========================================
+                        """
+                    }
+
+                    env.SOURCE_BRANCH = "staging"
+
+                    echo """
+                    ==========================================
+                    STAGING VALIDATION PASSED
+                    ==========================================
+
+                    Release Tag:
+                    ${env.RELEASE_TAG}
+
                     Source Branch:
                     ${env.SOURCE_BRANCH}
 
-                    Commit:
+                    Tagged Commit:
                     ${env.TAG_COMMIT}
 
                     ==========================================
@@ -318,7 +337,7 @@ pipeline {
             steps {
                 echo """
                 ==========================================
-                Environment Information
+                ENVIRONMENT INFORMATION
                 ==========================================
 
                 Repository:
@@ -363,58 +382,23 @@ pipeline {
             steps {
                 script {
 
-                    def imageTag
+                    env.IMAGE_TAG = env.RELEASE_TAG
 
-                    if (params.ROLLBACK) {
+                    echo """
+                    ==========================================
+                    DOCKER TAG
+                    ==========================================
 
-                        if (!params.TARGET_VERSION?.trim()) {
-                            error(
-                                "Rollback requested but TARGET_VERSION was not provided."
-                            )
-                        }
+                    Git Release Tag:
+                    ${env.RELEASE_TAG}
 
-                        imageTag = params.TARGET_VERSION.trim()
+                    Docker Image Tag:
+                    ${env.IMAGE_TAG}
 
-                        if (!(imageTag ==~ /^v.*/)) {
-                            error(
-                                "Invalid rollback version '${imageTag}'. " +
-                                "Rollback versions must start with 'v'."
-                            )
-                        }
-
-                        echo """
-                        ==========================================
-                        ROLLBACK REQUESTED
-                        ==========================================
-
-                        Rollback Version:
-                        ${imageTag}
-
-                        ==========================================
-                        """
-
-                    } else {
-
-                        imageTag = env.RELEASE_TAG
-
-                        echo """
-                        ==========================================
-                        RELEASE DEPLOYMENT
-                        ==========================================
-
-                        Release Tag:
-                        ${imageTag}
-
-                        ==========================================
-                        """
-                    }
-
-                    env.IMAGE_TAG = imageTag
-
-                    echo "FINAL Docker Tag: ${env.IMAGE_TAG}"
+                    ==========================================
+                    """
                 }
             }
         }
-
     }
 }
