@@ -400,6 +400,39 @@ pipeline {
                 }
             }
         }
+            stage('Build') {
+            steps {
+                script {
+
+                    echo """
+                    ==========================================
+                    BUILD
+                    ==========================================
+
+                    Release:
+                    ${env.RELEASE_TAG}
+
+                    Docker Tag:
+                    ${env.IMAGE_TAG}
+
+                    ==========================================
+                    """
+
+                    /*
+                     * Add actual build command here.
+                     *
+                     * Example:
+                     *
+                     * sh """
+                     *     docker build \
+                     *         -t ${env.IMAGE_NAME}:${env.IMAGE_TAG} .
+                     * """
+                     */
+
+                    echo "Build stage completed."
+                }
+            }
+        }
     }
 }
 
