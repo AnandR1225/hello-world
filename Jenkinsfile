@@ -9,96 +9,48 @@ pipeline {
     }
 
     environment {
-        GIT_REPO           = "https://github.com/AnandR1225/hello-world.git"
-        GIT_CREDENTIALS_ID = "github1"
+        DOCKER_REPO           = "prophazedocker/ml-api-discovery"
+        DOCKER_CREDENTIALS_ID = "prophaze-docker"
+        KUBE_CRED             = "ml-api"
+        NAMESPACE             = "ml-api-discovery-prod"
+        SOURCE_BRANCH         = "staging"
+        AWS_REGION            = "ap-south-1"
+    }
 
-        // Enable these when actual deployment is configured
-        // DOCKER_CREDENTIALS_ID       = "docker-report"
-        // SONARQUBE_ENV               = "sonar-server"
-        // NAMESPACE                   = "reports"
-        // DEPLOY_ENV                  = "production"
-        // IMAGE_NAME                  = "prophazedocker/i-report"
-        // KUBERNETES_CREDENTIALS_ID   = "k3s-report-staging"
-        // DEPLOYMENT_FILE             = "prod-reports.yaml"
-        // DEPLOYMENT_NAME             = "prod-reports-api"
+    triggers {
+        githubPush()
     }
 
     stages {
 
-        /*
-         * ============================================================
-         * CLEAN WORKSPACE
-         * ============================================================
-         */
-
-        stage('Clean Workspace') {
+        stage('Checkout') {
             steps {
-                cleanWs()
-            }
-        }
-
-        /*
-         * ============================================================
-         * CHECKOUT TAG
-         * ============================================================
-         */
-
-        stage('Checkout Tag') {
-            steps {
-                script {
-
-                    echo "=========================================="
-                    echo "Checking out Git tag"
-                    echo "=========================================="
-
-                    /*
-                     * Jenkins SCM configuration determines which
-                     * tag triggered this build.
-                     *
-                     * Do NOT checkout master/staging manually here.
-                     */
-
+                withEnv(['GIT_LFS_SKIP_SMUDGE=1']) {
                     checkout scm
-
-                    sh '''
-                        echo "=========================================="
-                        echo "Git Information"
-                        echo "=========================================="
-
-                        echo "Commit:"
-                        git log -1 --oneline
-
-                        echo ""
-                        echo "HEAD:"
-                        git rev-parse HEAD
-
-                        echo ""
-                        echo "Tags pointing to HEAD:"
-                        git tag --points-at HEAD || true
-
-                        echo "=========================================="
-                    '''
                 }
+
+                sh '''
+                    set -e
+
+                    echo "=========================================="
+                    echo "Git Information"
+                    echo "=========================================="
+
+                    git log -1 --oneline
+                    git rev-parse HEAD
+
+                    echo ""
+                    echo "Tags on current commit:"
+                    git tag --points-at HEAD || true
+
+                    echo "=========================================="
+                '''
             }
         }
 
-        /*
-         * ============================================================
-         * VALIDATE TAG
-         * ============================================================
-         */
-
-        stage('Validate Tag') {
+        stage('Validate Production Tag') {
             steps {
                 script {
-
-                    /*
-                     * Find the tag pointing to the checked-out commit.
-                     *
-                     * We intentionally don't depend only on TAG_NAME,
-                     * because TAG_NAME may not always be populated
-                     * depending on how Jenkins SCM is configured.
-                     */
 
                     def tagName = sh(
                         script: '''
@@ -107,333 +59,142 @@ pipeline {
                         returnStdout: true
                     ).trim()
 
-                    /*
-                     * Fallback
-                     */
+                    if (!tagName && env.TAG_NAME?.trim()) {
+                        tagName = env.TAG_NAME.trim()
+                    }
 
                     if (!tagName) {
-                        tagName = sh(
-                            script: '''
-                                git describe \
-                                    --tags \
-                                    --exact-match \
-                                    HEAD \
-                                    2>/dev/null || true
-                            ''',
-                            returnStdout: true
-                        ).trim()
+                        error("No Git tag found. Production deployments require a version tag.")
                     }
 
-                    /*
-                     * No tag = stop
-                     */
-
-                    if (!tagName) {
-                        error """
-                        ==========================================
-                        TAG VALIDATION FAILED
-                        ==========================================
-
-                        No Git tag was found on the checked-out commit.
-
-                        This Jenkins pipeline accepts only Git tags.
-
-                        Expected:
-                        v1.0.0
-
-                        ==========================================
-                        """
+                    if (!(tagName ==~ /^v\d+\.\d+\.\d+$/)) {
+                        error(
+                            "Invalid production tag '${tagName}'. " +
+                            "Expected format: vX.Y.Z, for example v1.2.0"
+                        )
                     }
-
-                    /*
-                     * Only v* tags are allowed
-                     */
-
-                    if (!(tagName ==~ /^v.*/)) {
-                        error """
-                        ==========================================
-                        INVALID TAG
-                        ==========================================
-
-                        Tag:
-                        ${tagName}
-
-                        Only tags beginning with 'v' are allowed.
-
-                        Valid examples:
-                        v1.0.0
-                        v1.0.1
-                        v2.0.0
-
-                        ==========================================
-                        """
-                    }
-
-                    /*
-                     * Save release tag
-                     */
 
                     env.RELEASE_TAG = tagName
-
-                    /*
-                     * Get tagged commit
-                     */
-
-                    env.TAG_COMMIT = sh(
+                    env.IMAGE_TAG   = tagName
+                    env.TAG_COMMIT  = sh(
                         script: 'git rev-parse HEAD',
                         returnStdout: true
                     ).trim()
-
-                    echo """
-                    ==========================================
-                    TAG VALIDATION SUCCESSFUL
-                    ==========================================
-
-                    Release Tag:
-                    ${env.RELEASE_TAG}
-
-                    Tagged Commit:
-                    ${env.TAG_COMMIT}
-
-                    ==========================================
-                    """
                 }
             }
         }
 
-        /*
-         * ============================================================
-         * VALIDATE STAGING SOURCE
-         * ============================================================
-         */
-
-        stage('Validate Staging Source') {
+        stage('Validate Main Source') {
             steps {
                 script {
 
-                    echo "Fetching staging branch..."
-
-                    /*
-                     * Fetch staging only for validation.
-                     *
-                     * This does NOT change the checked-out tag.
-                     */
-
                     sh '''
+                        set -e
+
                         git fetch origin \
-                            staging:refs/remotes/origin/staging
+                            main:refs/remotes/origin/main
                     '''
 
-                    /*
-                     * Get staging HEAD
-                     */
-
-                    def stagingCommit = sh(
-                        script: 'git rev-parse origin/staging',
+                    def mainCommit = sh(
+                        script: 'git rev-parse origin/main',
                         returnStdout: true
                     ).trim()
 
-                    /*
-                     * Save for later stages
-                     */
+                    echo "Main HEAD: ${mainCommit}"
+                    echo "Tagged commit: ${env.TAG_COMMIT}"
 
-                    env.STAGING_COMMIT = stagingCommit
-
-                    echo """
-                    ==========================================
-                    STAGING VALIDATION
-                    ==========================================
-
-                    Release Tag:
-                    ${env.RELEASE_TAG}
-
-                    Tagged Commit:
-                    ${env.TAG_COMMIT}
-
-                    Staging HEAD:
-                    ${env.STAGING_COMMIT}
-
-                    ==========================================
-                    """
-
-                    /*
-                     * Check whether the tagged commit exists
-                     * in the staging branch history.
-                     *
-                     * This is better than comparing:
-                     *
-                     * tagCommit == stagingCommit
-                     *
-                     * because staging can move forward after
-                     * a release tag is created.
-                     */
-
-                    def stagingCheck = sh(
+                    def result = sh(
                         script: """
                             git merge-base \
                                 --is-ancestor \
                                 ${env.TAG_COMMIT} \
-                                origin/staging
+                                origin/main
                         """,
                         returnStatus: true
                     )
 
-                    if (stagingCheck != 0) {
-
-                        error """
-                        ==========================================
-                        INVALID TAG SOURCE
-                        ==========================================
-
-                        Release Tag:
-                        ${env.RELEASE_TAG}
-
-                        Tagged Commit:
-                        ${env.TAG_COMMIT}
-
-                        Staging HEAD:
-                        ${env.STAGING_COMMIT}
-
-                        RESULT:
-                        The tagged commit does NOT exist in the
-                        staging branch history.
-
-                        Only tags created from commits belonging
-                        to the staging branch are allowed.
-
-                        ==========================================
-                        """
+                    if (result != 0) {
+                        error(
+                            "Production tag ${env.RELEASE_TAG} does not " +
+                            "belong to the main branch history."
+                        )
                     }
 
-                    env.SOURCE_BRANCH = "staging"
-
-                    echo """
-                    ==========================================
-                    STAGING VALIDATION PASSED
-                    ==========================================
-
-                    Release Tag:
-                    ${env.RELEASE_TAG}
-
-                    Source Branch:
-                    ${env.SOURCE_BRANCH}
-
-                    Tagged Commit:
-                    ${env.TAG_COMMIT}
-
-                    ==========================================
-                    """
+                    echo "Production source validation passed."
                 }
             }
         }
 
-        /*
-         * ============================================================
-         * ENVIRONMENT INFORMATION
-         * ============================================================
-         */
-
-        stage('Environment Info') {
-            steps {
-                echo """
-                ==========================================
-                ENVIRONMENT INFORMATION
-                ==========================================
-
-                Repository:
-                ${env.GIT_REPO}
-
-                Source Branch:
-                ${env.SOURCE_BRANCH}
-
-                Release Tag:
-                ${env.RELEASE_TAG}
-
-                Commit:
-                ${env.TAG_COMMIT}
-
-                Deploy Environment:
-                ${env.DEPLOY_ENV ?: 'Not configured'}
-
-                Docker Image:
-                ${env.IMAGE_NAME ?: 'Not configured'}
-
-                Namespace:
-                ${env.NAMESPACE ?: 'Not configured'}
-
-                Deployment File:
-                ${env.DEPLOYMENT_FILE ?: 'Not configured'}
-
-                Deployment Name:
-                ${env.DEPLOYMENT_NAME ?: 'Not configured'}
-
-                ==========================================
-                """
-            }
-        }
-
-        /*
-         * ============================================================
-         * GENERATE DOCKER TAG
-         * ============================================================
-         */
-
-        stage('Generate Docker Tag') {
+        stage('Detect Changed Services') {
             steps {
                 script {
 
-                    env.IMAGE_TAG = env.RELEASE_TAG
+                    sh '''
+                        set -e
+                        git fetch --tags --force
+                    '''
+                    def previousTag = sh(
+                        script: """
+                            git tag --sort=-creatordate \
+                                --list 'v[0-9]*.[0-9]*.[0-9]*' \
+                                | grep -Fxv '${env.RELEASE_TAG}' \
+                                | grep -E '^v[0-9]+\\.[0-9]+\\.[0-9]+$' \
+                                | head -n 1 || true
+                        """,
+                        returnStdout: true
+                    ).trim()
 
-                    echo """
-                    ==========================================
-                    DOCKER TAG
-                    ==========================================
+                    def baseRef
 
-                    Git Release Tag:
-                    ${env.RELEASE_TAG}
+                    if (previousTag) {
 
-                    Docker Image Tag:
-                    ${env.IMAGE_TAG}
+                        baseRef = previousTag
 
-                    ==========================================
-                    """
-                }
-            }
-        }
-            stage('Build') {
-            steps {
-                script {
+                        echo "Previous production tag: ${previousTag}"
 
-                    echo """
-                    ==========================================
-                    BUILD
-                    ==========================================
+                    } else {
 
-                    Release:
-                    ${env.RELEASE_TAG}
+                        baseRef = sh(
+                            script: "git rev-list --max-parents=0 ${env.RELEASE_TAG}",
+                            returnStdout: true
+                        ).trim()
 
-                    Docker Tag:
-                    ${env.IMAGE_TAG}
+                        echo "No previous production tag found."
+                        echo "Using initial commit: ${baseRef}"
+                    }
 
-                    ==========================================
-                    """
+                    def changedFiles = sh(
+                        script: """
+                            git diff \
+                                --name-only \
+                                ${baseRef} \
+                                ${env.RELEASE_TAG}
+                        """,
+                        returnStdout: true
+                    ).trim()
 
-                    /*
-                     * Add actual build command here.
-                     *
-                     * Example:
-                     *
-                     * sh """
-                     *     docker build \
-                     *         -t ${env.IMAGE_NAME}:${env.IMAGE_TAG} .
-                     * """
-                     */
+                    env.BUILD_API = changedFiles.contains(
+                        "api_discovery/api_discovery_v1/"
+                    ) ? "true" : "false"
 
-                    echo "Build stage completed."
+                    env.BUILD_TOKENIZER = changedFiles.contains(
+                        "api_discovery/tokenizer/"
+                    ) ? "true" : "false"
+
+                    if (
+                        env.BUILD_API != "true" &&
+                        env.BUILD_TOKENIZER != "true"
+                    ) {
+                        error(
+                            "No API or Tokenizer changes detected. " +
+                            "Nothing to deploy."
+                        )
+                    }
+
+                    echo "BUILD_API=${env.BUILD_API}"
+                    echo "BUILD_TOKENIZER=${env.BUILD_TOKENIZER}"
                 }
             }
         }
     }
 }
-
-// jenkinsfile testing webhook configured, now i need to test.
