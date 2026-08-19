@@ -255,4 +255,4 @@ pipeline {
 
 }
 
-// jenkinsfile testing 
+// testing ci/cd pipeline script, when developer push tag then jenkins job will be triggered auto.
