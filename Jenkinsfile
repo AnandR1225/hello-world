@@ -81,7 +81,7 @@ pipeline {
                         set -e
 
                         git fetch origin \
-                            staging:refs/remotes/origin/staging
+                            build/jenkins-testing:refs/remotes/origin/build/jenkins-testing
                     '''
 
                     def result = sh(
