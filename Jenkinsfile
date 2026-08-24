@@ -27,61 +27,94 @@ pipeline {
                 sh '''
                     set -e
 
+                    echo "======================================"
                     echo "Commit:"
                     git log -1 --oneline
 
                     echo "Commit SHA:"
                     git rev-parse HEAD
 
-                    echo "Tag:"
+                    echo "Current Branch:"
+                    git branch --show-current || true
+
+                    echo "Tags on HEAD:"
                     git tag --points-at HEAD || true
+
+                    echo "======================================"
                 '''
             }
         }
 
-        stage('Validate Staging Tag') {
+        stage('Detect Build Type') {
             steps {
                 script {
+
                     def tagName = sh(
                         script: 'git tag --points-at HEAD | head -n 1',
                         returnStdout: true
                     ).trim()
 
-                    if (!tagName) {
-                        error(
-                            "No Git tag found. " +
-                            "Staging deployment requires a release candidate tag."
-                        )
+                    env.RELEASE_TAG = ""
+                    env.IMAGE_TAG = ""
+                    env.TAG_COMMIT = ""
+
+                    if (tagName) {
+
+                        echo "Tag detected: ${tagName}"
+
+                        if (!(tagName ==~ /^v\\d+\\.\\d+\\.\\d+-rc\\d+$/)) {
+                            error(
+                                "Invalid tag '${tagName}'. " +
+                                "Expected format: vX.Y.Z-rcN, e.g. v1.2.22-rc1"
+                            )
+                        }
+
+                        env.RELEASE_TAG = tagName
+                        env.IMAGE_TAG = tagName
+
+                        env.TAG_COMMIT = sh(
+                            script: 'git rev-parse HEAD',
+                            returnStdout: true
+                        ).trim()
+
+                        env.BUILD_TYPE = "TAG"
+
+                        echo "======================================"
+                        echo "Build Type : TAG"
+                        echo "Release Tag: ${env.RELEASE_TAG}"
+                        echo "Tag Commit : ${env.TAG_COMMIT}"
+                        echo "======================================"
+
+                    } else {
+
+                        env.BUILD_TYPE = "STAGING"
+
+                        echo "======================================"
+                        echo "Build Type : STAGING"
+                        echo "No release tag found on HEAD."
+                        echo "======================================"
                     }
-
-                    if (!(tagName ==~ /^v\d+\.\d+\.\d+-rc\d+$/)) {
-                        error(
-                            "Invalid tag '${tagName}'. " +
-                            "Expected format: vX.Y.Z-rcN, e.g. v1.2.22-rc1"
-                        )
-                    }
-
-                    env.RELEASE_TAG = tagName
-                    env.IMAGE_TAG = tagName
-
-                    env.TAG_COMMIT = sh(
-                        script: 'git rev-parse HEAD',
-                        returnStdout: true
-                    ).trim()
-
-                    echo "Staging Release Tag: ${env.RELEASE_TAG}"
                 }
             }
         }
 
         stage('Validate Staging Branch') {
+            when {
+                expression {
+                    return env.BUILD_TYPE == "TAG"
+                }
+            }
+
             steps {
                 script {
+
                     sh '''
                         set -e
 
+                        echo "Fetching latest staging branch..."
+
                         git fetch origin \
-                            build/jenkins-testing:refs/remotes/origin/build/jenkins-testing
+                            staging:refs/remotes/origin/staging
                     '''
 
                     def result = sh(
@@ -101,10 +134,42 @@ pipeline {
                         )
                     }
 
-                    echo "Tag belongs to staging branch."
+                    echo "======================================"
+                    echo "Tag Validation Successful"
+                    echo "Tag ${env.RELEASE_TAG} belongs to staging."
+                    echo "======================================"
                 }
             }
         }
+
+        stage('Set Image Tag') {
+            steps {
+                script {
+
+                    if (env.BUILD_TYPE == "TAG") {
+
+                        env.IMAGE_TAG = env.RELEASE_TAG
+
+                    } else {
+
+                        def commitSha = sh(
+                            script: 'git rev-parse --short HEAD',
+                            returnStdout: true
+                        ).trim()
+
+                        env.IMAGE_TAG = "staging-${commitSha}"
+                    }
+
+                    echo "Docker Image Tag: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        /*
+        ============================================================
+        Docker Login
+        ============================================================
+        */
 
         // stage('Docker Login') {
         //     steps {
@@ -116,6 +181,8 @@ pipeline {
         //             )
         //         ]) {
         //             sh '''
+        //                 set -e
+        //
         //                 echo "$DOCKER_PASSWORD" |
         //                 docker login \
         //                     --username "$DOCKER_USER" \
@@ -125,25 +192,37 @@ pipeline {
         //     }
         // }
 
+        /*
+        ============================================================
+        Build & Push API
+        ============================================================
+        */
+
         // stage('Build & Push API') {
         //     steps {
         //         script {
         //             env.API_IMAGE =
         //                 "${DOCKER_REPO}:api-${IMAGE_TAG}"
         //         }
-
+        //
         //         sh '''
         //             set -e
-
+        //
         //             docker build \
         //                 --pull \
         //                 -t "$API_IMAGE" \
         //                 api_discovery/api_discovery_v1/
-
+        //
         //             docker push "$API_IMAGE"
         //         '''
         //     }
         // }
+
+        /*
+        ============================================================
+        Build & Push Tokenizer
+        ============================================================
+        */
 
         // stage('Build & Push Tokenizer') {
         //     steps {
@@ -151,7 +230,7 @@ pipeline {
         //             env.TOKENIZER_IMAGE =
         //                 "${DOCKER_REPO}:tokenizer-${IMAGE_TAG}"
         //         }
-
+        //
         //         withCredentials([
         //             string(
         //                 credentialsId: 'Access-key',
@@ -164,7 +243,7 @@ pipeline {
         //         ]) {
         //             sh '''
         //                 set -e
-
+        //
         //                 docker build \
         //                     --pull \
         //                     --build-arg AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
@@ -172,42 +251,48 @@ pipeline {
         //                     --build-arg AWS_DEFAULT_REGION="$AWS_REGION" \
         //                     -t "$TOKENIZER_IMAGE" \
         //                     api_discovery/tokenizer/
-
+        //
         //                 docker push "$TOKENIZER_IMAGE"
         //             '''
         //         }
         //     }
         // }
 
+        /*
+        ============================================================
+        Deploy API
+        ============================================================
+        */
+
         // stage('Deploy API') {
         //     steps {
         //         withKubeConfig(credentialsId: KUBE_CRED) {
         //             sh '''
         //                 set -e
-
+        //
         //                 kubectl apply \
         //                     -f api_discovery/api_discovery_v1/deployment/fastapi.yaml \
         //                     -n "$NAMESPACE"
-
+        //
         //                 kubectl apply \
         //                     -f api_discovery/api_discovery_v1/deployment/celery.yaml \
         //                     -n "$NAMESPACE"
-
+        //
         //                 kubectl set image \
         //                     deployment/fastapi-app \
         //                     fastapi="$API_IMAGE" \
         //                     -n "$NAMESPACE"
-
+        //
         //                 kubectl set image \
         //                     deployment/celery-worker \
         //                     celery="$API_IMAGE" \
         //                     -n "$NAMESPACE"
-
+        //
         //                 kubectl rollout status \
         //                     deployment/fastapi-app \
         //                     -n "$NAMESPACE" \
         //                     --timeout=5m
-
+        //
         //                 kubectl rollout status \
         //                     deployment/celery-worker \
         //                     -n "$NAMESPACE" \
@@ -216,22 +301,28 @@ pipeline {
         //         }
         //     }
         // }
+
+        /*
+        ============================================================
+        Deploy Tokenizer
+        ============================================================
+        */
 
         // stage('Deploy Tokenizer') {
         //     steps {
         //         withKubeConfig(credentialsId: KUBE_CRED) {
         //             sh '''
         //                 set -e
-
+        //
         //                 kubectl apply \
         //                     -f api_discovery/tokenizer/deployment/tokenizer.yaml \
         //                     -n "$NAMESPACE"
-
+        //
         //                 kubectl set image \
         //                     deployment/tokenizer \
         //                     tokenizer="$TOKENIZER_IMAGE" \
         //                     -n "$NAMESPACE"
-
+        //
         //                 kubectl rollout status \
         //                     deployment/tokenizer \
         //                     -n "$NAMESPACE" \
@@ -240,6 +331,12 @@ pipeline {
         //         }
         //     }
         // }
+
+        /*
+        ============================================================
+        Verify Deployment
+        ============================================================
+        */
 
         // stage('Verify Deployment') {
         //     steps {
@@ -253,8 +350,20 @@ pipeline {
         // }
     }
 
-}
+    post {
+        success {
+            echo "======================================"
+            echo "Jenkins build completed successfully."
+            echo "Build Type : ${env.BUILD_TYPE}"
+            echo "Image Tag  : ${env.IMAGE_TAG}"
+            echo "======================================"
+        }
 
-// testing ci/cd pipeline script, when developer push tag then jenkins job will be triggered auto.
-// one more ci/cd testing
-// testing with jeril from ml Team
+        failure {
+            echo "======================================"
+            echo "Jenkins build failed."
+            echo "Build Type : ${env.BUILD_TYPE}"
+            echo "======================================"
+        }
+    }
+}
