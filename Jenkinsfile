@@ -21,16 +21,6 @@ pipeline {
 
     stages {
 
-        /*
-         * GitHub Push → Jenkins
-         *
-         * This pipeline is intended to run when an RC tag is pushed.
-         *
-         * Example:
-         *   git tag v1.2.22-rc1
-         *   git push origin v1.2.22-rc1
-         */
-
         stage('Checkout') {
             steps {
                 checkout scm
@@ -79,13 +69,6 @@ pipeline {
                         )
                     }
 
-                    /*
-                     * Expected tag format:
-                     *
-                     * v1.2.22-rc1
-                     * v1.3.0-rc1
-                     * v2.0.0-rc10
-                     */
                     if (!(tagName ==~ /^v\d+\.\d+\.\d+-rc\d+$/)) {
                         error(
                             "Invalid tag '${tagName}'. " +
@@ -95,7 +78,7 @@ pipeline {
                     }
 
                     env.RELEASE_TAG = tagName
-                    env.IMAGE_TAG   = tagName
+                    env.IMAGE_TAG = tagName
 
                     env.TAG_COMMIT = sh(
                         script: '''
@@ -117,17 +100,6 @@ pipeline {
             steps {
                 script {
 
-                    /*
-                     * Fetch the staging branch explicitly.
-                     *
-                     * The previous pipeline fetched:
-                     *   build/jenkins-testing
-                     *
-                     * but later validated against:
-                     *   origin/staging
-                     *
-                     * This version keeps both operations consistent.
-                     */
                     sh '''
                         set -e
 
@@ -139,13 +111,6 @@ pipeline {
                         echo "Staging branch fetched successfully."
                     '''
 
-                    /*
-                     * Check whether the tagged commit is an ancestor
-                     * of the current staging branch.
-                     *
-                     * This ensures the release candidate tag belongs
-                     * to the staging code line.
-                     */
                     def result = sh(
                         script: """
                             git merge-base \
@@ -171,7 +136,6 @@ pipeline {
                 }
             }
         }
-
     }
 
     post {
@@ -205,3 +169,4 @@ pipeline {
         }
     }
 }
+```
